@@ -1,0 +1,32 @@
+{
+  "name": "magpie-agt-plugin",
+  "version": "0.2.0",
+  "type": "module",
+  "license": "MIT",
+  "description": "Magpie provider plugin for Antigravity Tools",
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "magpie-plugin"
+  ],
+  "exports": {
+    "./server": "./index.mjs",
+    ".": "./index.mjs"
+  },
+  "main": "./index.mjs",
+  "magpie": {
+    "name": "Antigravity Tools",
+    "icon": "https://raw.githubusercontent.com/lbjlaq/Antigravity-Manager/main/src-tauri/icons/128x128.png",
+    "summary": {
+      "en": "Antigravity Tools provider plugin with dynamic model discovery, per-pool cooldown isolation, xhigh passthrough fix, weighted pool quotas, and optional per-account details.",
+      "zh": "Antigravity Tools 专用插件：全动态模型发现、按池冷却隔离、修正 xhigh 透传、与首页一致的加权配额，可选显示各账号明细。"
+    },
+    "options": {
+      "showAccountDetails": true,
+      "onlyProxyPool": true,
+      "refreshAgtOnUsage": true,
+      "refreshCooldownSec": 30,
+      "maxAccountDetails": 0
+    }
+  }
+}
