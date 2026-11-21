@@ -12,7 +12,12 @@ import {
   isAccountAbnormal,
   isValidationBlockActive,
 } from "../lib/quota.mjs";
-import { createAgtFetch, normalizeRateLimitErrorBody, rewriteUpstreamUrl } from "../lib/fetch.mjs";
+import {
+  clearPrefixEffortCache,
+  createAgtFetch,
+  normalizeRateLimitErrorBody,
+  rewriteUpstreamUrl,
+} from "../lib/fetch.mjs";
 import {
   DEFAULT_BASE_URL,
   clearModelCache,
@@ -819,6 +824,7 @@ test("8. Plugin metadata, official HTTPS icon, zero 'AGT' in user copy, 30s cool
   assert.equal(pkg.license, "MIT");
   assert.equal(pkg.magpie.icon, OFFICIAL_ICON_URL);
   assert.equal(pkg.magpie.options.foldEffortVariants, false);
+  assert.equal(pkg.magpie.options.preserveCacheEffort, true);
   assert.equal(pkg.magpie.options.refreshCooldownSec, 30);
   assert.equal(pkg.magpie.options.maxAccountDetails, 0);
   assert.equal(/\bAGT\b/.test(pkg.description), false);
@@ -838,10 +844,13 @@ test("8. Plugin metadata, official HTTPS icon, zero 'AGT' in user copy, 30s cool
   assert.equal(hooks.auth.provider, "agt");
   assert.equal(hooks.auth.single, true);
   assert.equal(hooks.auth.icon, OFFICIAL_ICON_URL);
-  assert.equal(hooks.auth.options.length, 4);
+  assert.equal(hooks.auth.options.length, 5);
   const foldOpt = hooks.auth.options.find((o) => o.key === "fold_effort_variants");
   assert.ok(foldOpt, "fold_effort_variants option must exist");
   assert.equal(foldOpt.default, false);
+  const preserveOpt = hooks.auth.options.find((o) => o.key === "preserve_cache_effort");
+  assert.ok(preserveOpt, "preserve_cache_effort option must exist");
+  assert.equal(preserveOpt.default, true);
   for (const opt of hooks.auth.options) {
     assert.equal(opt.placement, undefined, `option ${opt.key} must not set placement:"top"`);
     assert.equal(/\bAGT\b/.test(opt.label), false);
@@ -960,4 +969,389 @@ test("8. Plugin metadata, official HTTPS icon, zero 'AGT' in user copy, 30s cool
   });
   assert.equal(fallbackRes.error, undefined);
   assert.equal(fallbackRes.plan, "PRO ×1");
+});
+
+test("9. Cache-affinity effort alignment: Gemini xhigh/high, manual UI downgrade, short utility exclusion, TTL, suffixed bypass, Anthropic guard, and live toggle", async () => {
+  clearModelCache();
+  clearPrefixEffortCache();
+
+  const LARGE_TEXT = "x".repeat(40 * 1024);
+  const SMALL_TEXT = "short utility prompt";
+  let nowMs = 1_000_000;
+  let livePreserve = true;
+  const captured = [];
+
+  const mockFetch = createAgtFetch({
+    baseUrl: "http://127.0.0.1:18055",
+    apiKey: "sk-test-key",
+    nowFn: () => nowMs,
+    getOptions: () => ({ preserveCacheEffort: livePreserve }),
+    fetchImpl: async (url, init) => {
+      if (url.endsWith("/v1/models")) {
+        return new Response(JSON.stringify(makeSampleV1Payload()), { status: 200 });
+      }
+      if (url.endsWith("/v1beta/models")) {
+        return new Response("Not Found", { status: 404 });
+      }
+      captured.push({
+        url,
+        headers: new Headers(init.headers),
+        body: JSON.parse(init.body),
+      });
+      return new Response("{}", { status: 200 });
+    },
+  });
+
+  const sharedSystem = { parts: [{ text: "You are a helpful coding assistant." }] };
+  const sharedFirstTurn = { role: "user", parts: [{ text: LARGE_TEXT }] };
+
+  // 1. Gemini main xhigh (maxOutputTokens: 65536) -> aux low (maxOutputTokens: 5000, same prefix) -> 2nd aux turn
+  await mockFetch("http://127.0.0.1:18055/v1beta/models/gemini-4-neon:streamGenerateContent?alt=sse", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Magpie-Effort": "xhigh" },
+    body: JSON.stringify({
+      systemInstruction: sharedSystem,
+      contents: [sharedFirstTurn],
+      generationConfig: {
+        maxOutputTokens: 65536,
+        thinkingConfig: { includeThoughts: true, thinkingLevel: "high", thinkingBudget: 8192 },
+      },
+    }),
+  });
+  assert.equal(captured[0].body.generationConfig.thinkingConfig.thinkingLevel, "xhigh");
+  assert.equal("thinkingBudget" in captured[0].body.generationConfig.thinkingConfig, false);
+
+  await mockFetch("http://127.0.0.1:18055/v1beta/models/gemini-4-neon:generateContent", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Magpie-Effort": "low", "Content-Length": "1234" },
+    body: JSON.stringify({
+      systemInstruction: sharedSystem,
+      contents: [sharedFirstTurn, { role: "model", parts: [{ text: "ok" }] }],
+      generationConfig: {
+        maxOutputTokens: 5000,
+        thinkingConfig: { includeThoughts: true, thinkingLevel: "low", thinkingBudget: 1024 },
+      },
+    }),
+  });
+  assert.equal(captured[1].body.generationConfig.thinkingConfig.thinkingLevel, "xhigh");
+  assert.equal(captured[1].body.generationConfig.thinkingConfig.includeThoughts, true);
+  assert.equal("thinkingBudget" in captured[1].body.generationConfig.thinkingConfig, false);
+  assert.equal(captured[1].body.generationConfig.maxOutputTokens, 5000);
+  assert.equal(captured[1].headers.has("content-length"), false);
+
+  // 2nd auxiliary turn right after is ALSO aligned to xhigh
+  await mockFetch("http://127.0.0.1:18055/v1beta/models/gemini-4-neon:generateContent", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Magpie-Effort": "low" },
+    body: JSON.stringify({
+      systemInstruction: sharedSystem,
+      contents: [
+        sharedFirstTurn,
+        { role: "model", parts: [{ text: "ok" }] },
+        { role: "user", parts: [{ text: "summarize tool output" }] },
+      ],
+      generationConfig: {
+        maxOutputTokens: 4096,
+        thinkingConfig: { includeThoughts: true, thinkingLevel: "low", thinkingBudget: 1024 },
+      },
+    }),
+  });
+  assert.equal(captured[2].body.generationConfig.thinkingConfig.thinkingLevel, "xhigh");
+  assert.equal("thinkingBudget" in captured[2].body.generationConfig.thinkingConfig, false);
+  assert.equal(captured[2].body.generationConfig.maxOutputTokens, 4096);
+
+  // 2. Gemini main high (gemini-4-hydrogen) -> aux low (maxOutputTokens: 5000, same prefix)
+  await mockFetch("http://127.0.0.1:18055/v1beta/models/gemini-4-hydrogen:generateContent", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Magpie-Effort": "high" },
+    body: JSON.stringify({
+      systemInstruction: sharedSystem,
+      contents: [sharedFirstTurn],
+      generationConfig: {
+        maxOutputTokens: 65536,
+        thinkingConfig: { includeThoughts: true, thinkingLevel: "high" },
+      },
+    }),
+  });
+  await mockFetch("http://127.0.0.1:18055/v1beta/models/gemini-4-hydrogen:generateContent", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Magpie-Effort": "low" },
+    body: JSON.stringify({
+      systemInstruction: sharedSystem,
+      contents: [sharedFirstTurn, { role: "model", parts: [{ text: "done" }] }],
+      generationConfig: {
+        maxOutputTokens: 5000,
+        thinkingConfig: { includeThoughts: true, thinkingLevel: "low" },
+      },
+    }),
+  });
+  assert.equal(captured[4].body.generationConfig.thinkingConfig.thinkingLevel, "high");
+  assert.equal(captured[4].body.generationConfig.maxOutputTokens, 5000);
+
+  // 3. Intentional manual UI downgrade on gemini-4-neon (xhigh -> low with maxOutputTokens: 65536)
+  // NOT rewritten, and updates warm session effort to low
+  await mockFetch("http://127.0.0.1:18055/v1beta/models/gemini-4-neon:generateContent", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Magpie-Effort": "low" },
+    body: JSON.stringify({
+      systemInstruction: sharedSystem,
+      contents: [sharedFirstTurn, { role: "user", parts: [{ text: "manual downgrade turn" }] }],
+      generationConfig: {
+        maxOutputTokens: 65536,
+        thinkingConfig: { includeThoughts: true, thinkingLevel: "low" },
+      },
+    }),
+  });
+  assert.equal(captured[5].body.generationConfig.thinkingConfig.thinkingLevel, "low");
+
+  // Subsequent aux minimal aligns to the updated warm effort ("low", NOT stale "xhigh")
+  await mockFetch("http://127.0.0.1:18055/v1beta/models/gemini-4-neon:generateContent", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Magpie-Effort": "minimal" },
+    body: JSON.stringify({
+      systemInstruction: sharedSystem,
+      contents: [sharedFirstTurn, { role: "user", parts: [{ text: "aux after manual downgrade" }] }],
+      generationConfig: {
+        maxOutputTokens: 4000,
+        thinkingConfig: { includeThoughts: true, thinkingLevel: "minimal" },
+      },
+    }),
+  });
+  assert.equal(captured[6].body.generationConfig.thinkingConfig.thinkingLevel, "low");
+
+  // 4. Short utility / title generation request (< 32KB) is NOT rewritten even on same prefix,
+  // and a standalone small-output short request does NOT pollute warm cache
+  await mockFetch("http://127.0.0.1:18055/v1beta/models/gemini-4-hydrogen:generateContent", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Magpie-Effort": "low" },
+    body: JSON.stringify({
+      systemInstruction: { parts: [{ text: "Generate a short title" }] },
+      contents: [{ role: "user", parts: [{ text: SMALL_TEXT }] }],
+      generationConfig: {
+        maxOutputTokens: 5000,
+        thinkingConfig: { thinkingLevel: "low" },
+      },
+    }),
+  });
+  assert.equal(captured[7].body.generationConfig.thinkingConfig.thinkingLevel, "low");
+
+  // Short request with same prefix (< 32KB) also stays low
+  await mockFetch("http://127.0.0.1:18055/v1beta/models/gemini-4-hydrogen:generateContent", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Magpie-Effort": "low" },
+    body: JSON.stringify({
+      systemInstruction: sharedSystem,
+      contents: [{ role: "user", parts: [{ text: SMALL_TEXT }] }],
+      generationConfig: {
+        maxOutputTokens: 5000,
+        thinkingConfig: { thinkingLevel: "low" },
+      },
+    }),
+  });
+  assert.equal(captured[8].body.generationConfig.thinkingConfig.thinkingLevel, "low");
+
+  // 5. TTL expiry: after 10 minutes + 1ms, auxiliary request is NOT rewritten
+  nowMs += 10 * 60 * 1000 + 1;
+  await mockFetch("http://127.0.0.1:18055/v1beta/models/gemini-4-hydrogen:generateContent", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Magpie-Effort": "low" },
+    body: JSON.stringify({
+      systemInstruction: sharedSystem,
+      contents: [sharedFirstTurn],
+      generationConfig: {
+        maxOutputTokens: 5000,
+        thinkingConfig: { thinkingLevel: "low" },
+      },
+    }),
+  });
+  assert.equal(captured[9].body.generationConfig.thinkingConfig.thinkingLevel, "low");
+
+  // 6. Suffixed models (gemini-4-neon-xhigh / gemini-4-neon-low) are untouched by prefix-effort rewriting
+  await mockFetch("http://127.0.0.1:18055/v1beta/models/gemini-4-neon-xhigh:generateContent", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      systemInstruction: sharedSystem,
+      contents: [sharedFirstTurn],
+      generationConfig: {
+        maxOutputTokens: 65536,
+        thinkingConfig: { thinkingLevel: "xhigh" },
+      },
+    }),
+  });
+  await mockFetch("http://127.0.0.1:18055/v1beta/models/gemini-4-neon-xhigh:generateContent", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      systemInstruction: sharedSystem,
+      contents: [sharedFirstTurn],
+      generationConfig: {
+        maxOutputTokens: 5000,
+        thinkingConfig: { thinkingLevel: "low" },
+      },
+    }),
+  });
+  assert.equal(captured[11].body.generationConfig.thinkingConfig.thinkingLevel, "low");
+
+  // 7. Anthropic (claude-opus-5-5):
+  // 7a. output_config.effort high -> aux low
+  await mockFetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "claude-opus-5-5",
+      system: "You are Claude.",
+      max_tokens: 65536,
+      thinking: { type: "adaptive" },
+      output_config: { effort: "high" },
+      messages: [{ role: "user", content: LARGE_TEXT }],
+    }),
+  });
+  await mockFetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "claude-opus-5-5",
+      system: "You are Claude.",
+      max_tokens: 5000,
+      thinking: { type: "adaptive" },
+      output_config: { effort: "low" },
+      messages: [
+        { role: "user", content: LARGE_TEXT },
+        { role: "assistant", content: "working" },
+      ],
+    }),
+  });
+  assert.equal(captured[13].body.output_config.effort, "high");
+  assert.deepEqual(captured[13].body.thinking, { type: "adaptive" });
+  assert.equal(captured[13].body.max_tokens, 5000);
+
+  // 7b. thinking.budget_tokens=16000 -> aux low (max_tokens: 5000): aligns back and bumps max_tokens > budget_tokens
+  const claudeBudgetFirst = { role: "user", content: `budget-session-${LARGE_TEXT}` };
+  await mockFetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "claude-opus-5-5",
+      system: "You are Claude.",
+      max_tokens: 65536,
+      thinking: { type: "enabled", budget_tokens: 16000 },
+      messages: [claudeBudgetFirst],
+    }),
+  });
+  await mockFetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "claude-opus-5-5",
+      system: "You are Claude.",
+      max_tokens: 5000,
+      thinking: { type: "enabled", budget_tokens: 1024 },
+      messages: [claudeBudgetFirst, { role: "assistant", content: "step 1" }],
+    }),
+  });
+  assert.deepEqual(captured[15].body.thinking, { type: "enabled", budget_tokens: 16000 });
+  assert.ok(
+    captured[15].body.max_tokens > captured[15].body.thinking.budget_tokens,
+    `expected max_tokens (${captured[15].body.max_tokens}) > budget_tokens (${captured[15].body.thinking.budget_tokens})`,
+  );
+  assert.equal(captured[15].body.max_tokens, 65536);
+
+  // 8. Option toggle preserveCacheEffort: false disables rewriting immediately via live getter
+  livePreserve = false;
+  await mockFetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "claude-opus-5-5",
+      system: "You are Claude.",
+      max_tokens: 5000,
+      thinking: { type: "adaptive" },
+      output_config: { effort: "low" },
+      messages: [{ role: "user", content: LARGE_TEXT }],
+    }),
+  });
+  assert.equal(captured[16].body.output_config.effort, "low");
+
+  // Also test static config preserveCacheEffort: false
+  clearPrefixEffortCache();
+  const disabledCaptured = [];
+  const disabledFetch = createAgtFetch({
+    baseUrl: "http://127.0.0.1:18055",
+    apiKey: "sk-test-key",
+    preserveCacheEffort: false,
+    fetchImpl: async (_url, init) => {
+      disabledCaptured.push(JSON.parse(init.body));
+      return new Response("{}", { status: 200 });
+    },
+  });
+  await disabledFetch("http://127.0.0.1:18055/v1beta/models/gemini-4-hydrogen:generateContent", {
+    method: "POST",
+    body: JSON.stringify({
+      systemInstruction: sharedSystem,
+      contents: [sharedFirstTurn],
+      generationConfig: { maxOutputTokens: 65536, thinkingConfig: { thinkingLevel: "high" } },
+    }),
+  });
+  await disabledFetch("http://127.0.0.1:18055/v1beta/models/gemini-4-hydrogen:generateContent", {
+    method: "POST",
+    body: JSON.stringify({
+      systemInstruction: sharedSystem,
+      contents: [sharedFirstTurn],
+      generationConfig: { maxOutputTokens: 5000, thinkingConfig: { thinkingLevel: "low" } },
+    }),
+  });
+  assert.equal(disabledCaptured[1].generationConfig.thinkingConfig.thinkingLevel, "low");
+
+  // Verify auth.loader wires live option toggling from index.mjs
+  clearPrefixEffortCache();
+  let uiPreserve = true;
+  const loaderHooks = await plugin.server({
+    magpie: {
+      options: () => ({ preserve_cache_effort: uiPreserve }),
+    },
+  });
+  const origFetch = globalThis.fetch;
+  const loaderBodies = [];
+  globalThis.fetch = async (_url, init) => {
+    loaderBodies.push(JSON.parse(init.body));
+    return new Response("{}", { status: 200 });
+  };
+  try {
+    const loaderResult = await loaderHooks.auth.loader(async () => ({
+      type: "api",
+      key: "sk-loader",
+      metadata: { baseUrl: "http://127.0.0.1:18056" },
+    }));
+    await loaderResult.fetch("http://127.0.0.1:18056/v1beta/models/gemini-4-hydrogen:generateContent", {
+      method: "POST",
+      body: JSON.stringify({
+        systemInstruction: sharedSystem,
+        contents: [sharedFirstTurn],
+        generationConfig: { maxOutputTokens: 65536, thinkingConfig: { thinkingLevel: "high" } },
+      }),
+    });
+    await loaderResult.fetch("http://127.0.0.1:18056/v1beta/models/gemini-4-hydrogen:generateContent", {
+      method: "POST",
+      body: JSON.stringify({
+        systemInstruction: sharedSystem,
+        contents: [sharedFirstTurn],
+        generationConfig: { maxOutputTokens: 5000, thinkingConfig: { thinkingLevel: "low" } },
+      }),
+    });
+    assert.equal(loaderBodies[1].generationConfig.thinkingConfig.thinkingLevel, "high");
+
+    uiPreserve = false;
+    await loaderResult.fetch("http://127.0.0.1:18056/v1beta/models/gemini-4-hydrogen:generateContent", {
+      method: "POST",
+      body: JSON.stringify({
+        systemInstruction: sharedSystem,
+        contents: [sharedFirstTurn],
+        generationConfig: { maxOutputTokens: 5000, thinkingConfig: { thinkingLevel: "low" } },
+      }),
+    });
+    assert.equal(loaderBodies[2].generationConfig.thinkingConfig.thinkingLevel, "low");
+  } finally {
+    globalThis.fetch = origFetch;
+  }
 });

@@ -26,6 +26,7 @@
       "onlyProxyPool": true,
       "refreshAgtOnUsage": true,
       "foldEffortVariants": false,
+      "preserveCacheEffort": true,
       "refreshCooldownSec": 30,
       "maxAccountDetails": 0
     }

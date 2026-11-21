@@ -69,6 +69,7 @@ function readLiveOptions(input, staticOptions) {
     onlyProxyPool: pickBool("onlyProxyPool", "only_proxy_pool", true),
     refreshAgtOnUsage: pickBool("refreshAgtOnUsage", "refresh_agt_on_usage", true),
     foldEffortVariants: pickBool("foldEffortVariants", "fold_effort_variants", false),
+    preserveCacheEffort: pickBool("preserveCacheEffort", "preserve_cache_effort", true),
     cacheTtlSec: pickNum("cacheTtlSec", "cache_ttl_sec", 0),
     refreshCooldownSec: pickNum("refreshCooldownSec", "refresh_cooldown_sec", 30),
     maxAccountDetails: Math.floor(pickNum("maxAccountDetails", "max_account_details", 0)),
@@ -143,6 +144,17 @@ async function server(input, options) {
           },
           default: false,
         },
+        {
+          key: "preserve_cache_effort",
+          label: "Preserve session effort for cache hits",
+          labels: { zh: "后台降档对齐会话档位（保缓存）" },
+          description:
+            "Keep warm-prefix auxiliary requests (lowered effort with capped max output tokens) on the session's active effort level to avoid cross-model prompt cache misses.",
+          descriptions: {
+            zh: "命中热缓存前缀的后台辅助请求同时降低思考档位并收紧最大输出上限时，自动对齐回会话当前档位，避免跨上游模型 ID 击穿缓存。",
+          },
+          default: true,
+        },
       ],
       methods: [
         {
@@ -179,6 +191,7 @@ async function server(input, options) {
             baseUrl,
             apiKey,
             getAuth,
+            getOptions: () => readLiveOptions(input, options),
           }),
         };
       },
