@@ -25,6 +25,7 @@
       "showAccountDetails": true,
       "onlyProxyPool": true,
       "refreshAgtOnUsage": true,
+      "foldEffortVariants": false,
       "refreshCooldownSec": 30,
       "maxAccountDetails": 0
     }

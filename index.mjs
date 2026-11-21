@@ -68,6 +68,7 @@ function readLiveOptions(input, staticOptions) {
     showAccountDetails: pickBool("showAccountDetails", "show_account_details", true),
     onlyProxyPool: pickBool("onlyProxyPool", "only_proxy_pool", true),
     refreshAgtOnUsage: pickBool("refreshAgtOnUsage", "refresh_agt_on_usage", true),
+    foldEffortVariants: pickBool("foldEffortVariants", "fold_effort_variants", false),
     cacheTtlSec: pickNum("cacheTtlSec", "cache_ttl_sec", 0),
     refreshCooldownSec: pickNum("refreshCooldownSec", "refresh_cooldown_sec", 30),
     maxAccountDetails: Math.floor(pickNum("maxAccountDetails", "max_account_details", 0)),
@@ -92,7 +93,10 @@ async function server(input, options) {
     provider: {
       id: "agt",
       async models(provider, ctx) {
-        return reconcileModels(provider, ctx);
+        const live = readLiveOptions(input, options);
+        return reconcileModels(provider, ctx, {
+          foldEffortVariants: live.foldEffortVariants,
+        });
       },
     },
 
@@ -127,6 +131,17 @@ async function server(input, options) {
             "Trigger Antigravity Tools to fetch fresh upstream quotas before reading account usage (with 30s cooldown protection).",
           descriptions: { zh: "刷新卡片用量前先触发 Antigravity Tools 拉取最新配额（带 30 秒冷却防抖）。" },
           default: true,
+        },
+        {
+          key: "fold_effort_variants",
+          label: "Fold effort-suffixed models into variants",
+          labels: { zh: "折叠思考强度后缀模型为变体" },
+          description:
+            "Hide separate -low/-medium/-high/-xhigh models and merge them into base model variants (off by default to keep both).",
+          descriptions: {
+            zh: "隐藏独立的 -low/-medium/-high/-xhigh 模型，合并为基础模型的思考强度变体（默认关闭，同时保留两者）。",
+          },
+          default: false,
         },
       ],
       methods: [
@@ -179,10 +194,13 @@ async function server(input, options) {
           onlyProxyPool: live.onlyProxyPool,
           showAccountDetails: live.showAccountDetails,
           maxAccountDetails: live.maxAccountDetails,
+          foldEffortVariants: live.foldEffortVariants,
           refreshAgtOnUsage: live.refreshAgtOnUsage,
           cacheTtlSec: live.cacheTtlSec,
           refreshCooldownSec: live.refreshCooldownSec,
-          discoveredModels: getDiscoveredModels(baseUrl) ?? provider?.models,
+          discoveredModels:
+            getDiscoveredModels(baseUrl, { foldEffortVariants: live.foldEffortVariants }) ??
+            provider?.models,
           signal: ctx?.signal,
         });
       },

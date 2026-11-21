@@ -377,16 +377,36 @@ test("3. Dynamic model discovery from /v1/models and /v1beta/models fallback", a
     },
   );
 
-  // Preserves -tiered models while folding effort suffixes
+  // Default mode (foldEffortVariants = false): preserves -tiered, base aliases WITH variants, AND effort-suffixed models
   assert.ok(models["gemini-4-hydrogen-tiered"], "gemini-4-hydrogen-tiered must be preserved");
   assert.deepEqual(Object.keys(models["gemini-4-hydrogen-tiered"].variants), ["high", "xhigh"]);
   assert.ok(models["gemini-3.8-flash-tiered"], "gemini-3.8-flash-tiered must be preserved");
   assert.equal(models["gemini-3.8-flash-tiered"].name, "Gemini 3.8 Flash Tiered");
   assert.deepEqual(Object.keys(models["gemini-3.8-flash-tiered"].variants), []);
 
-  // Canonical variant order: minimal, low, medium, high, xhigh, max
+  // Canonical variant order on base model: minimal, low, medium, high, xhigh, max
   assert.deepEqual(Object.keys(models["gemini-4-neon"].variants), ["minimal", "low", "medium", "high", "xhigh"]);
-  assert.equal(models["gemini-4-neon-xhigh"], undefined);
+
+  // Suffixed models also emitted independently with variants: {}, preserved display name, and reasoning: true
+  assert.ok(models["gemini-4-neon-xhigh"], "gemini-4-neon-xhigh must coexist by default");
+  assert.equal(models["gemini-4-neon-xhigh"].api.id, "gemini-4-neon-xhigh");
+  assert.equal(models["gemini-4-neon-xhigh"].name, "Gemini 4 Neon (XHigh)");
+  assert.deepEqual(models["gemini-4-neon-xhigh"].variants, {});
+  assert.equal(models["gemini-4-neon-xhigh"].capabilities.reasoning, true);
+
+  assert.ok(models["gemini-4-hydrogen-tiered-xhigh"]);
+  assert.equal(models["gemini-4-hydrogen-tiered-xhigh"].name, "Gemini 4 Hydrogen (XHigh)");
+  assert.deepEqual(models["gemini-4-hydrogen-tiered-xhigh"].variants, {});
+
+  assert.ok(models["claude-opus-5-5-high"]);
+  assert.equal(models["claude-opus-5-5-high"].name, "Claude Opus 5.5 (High)");
+  assert.equal(models["claude-opus-5-5-high"].api.npm, "@ai-sdk/anthropic");
+  assert.deepEqual(models["claude-opus-5-5-high"].variants, {});
+
+  assert.ok(models["gpt-oss-120b-medium"]);
+  assert.equal(models["gpt-oss-120b-medium"].name, "GPT-OSS 120B (Medium)");
+  assert.equal(models["gpt-oss-120b-medium"].api.npm, "@ai-sdk/openai-compatible");
+  assert.deepEqual(models["gpt-oss-120b-medium"].variants, {});
 
   // Protocol routing
   assert.equal(models["claude-opus-5-5"].api.npm, "@ai-sdk/anthropic");
@@ -409,13 +429,20 @@ test("3. Dynamic model discovery from /v1/models and /v1beta/models fallback", a
   assert.equal(models["gemini-4-neon"].capabilities.input.video, true);
   assert.equal(models["gemini-4-neon"].capabilities.input.pdf, true);
 
-  // Runtime cache populated
-  assert.ok(getDiscoveredModels("http://127.0.0.1:18045"));
+  // Runtime cache populated and supports live switching between unfolded and folded modes
+  const cachedDefault = getDiscoveredModels("http://127.0.0.1:18045");
+  assert.ok(cachedDefault?.["gemini-4-neon"]);
+  assert.ok(cachedDefault?.["gemini-4-neon-xhigh"]);
+  const cachedFolded = getDiscoveredModels("http://127.0.0.1:18045", { foldEffortVariants: true });
+  assert.ok(cachedFolded?.["gemini-4-neon"]);
+  assert.equal(cachedFolded?.["gemini-4-neon-xhigh"], undefined);
+  assert.deepEqual(Object.keys(cachedFolded["gemini-4-neon"].variants), ["minimal", "low", "medium", "high", "xhigh"]);
   assert.equal(isXhighGeminiModel("http://127.0.0.1:18045", "gemini-4-neon"), true);
+  assert.equal(isXhighGeminiModel("http://127.0.0.1:18045", "gemini-4-neon-xhigh"), false);
   assert.equal(isXhighGeminiModel("http://127.0.0.1:18045", "gemini-4-hydrogen-tiered"), true);
   assert.equal(isXhighGeminiModel("http://127.0.0.1:18045", "gemini-4-argon"), false);
 
-  // Offline fallback returns cached models tagged with magpie.fellBack
+  // Offline fallback returns cached models tagged with magpie.fellBack (respecting foldEffortVariants)
   const fellBack = await reconcileModels(
     { id: "agt" },
     { auth: { type: "api", key: "sk-test", metadata: { baseUrl: "http://127.0.0.1:18045" } } },
@@ -423,30 +450,51 @@ test("3. Dynamic model discovery from /v1/models and /v1beta/models fallback", a
   );
   assert.equal(fellBack[Symbol.for("magpie.fellBack")], true);
   assert.ok(fellBack["gemini-4-neon"]);
+  assert.ok(fellBack["gemini-4-neon-xhigh"]);
 
-  // /v1beta/models fallback when /v1/models fails on a fresh baseUrl
+  const fellBackFolded = await reconcileModels(
+    { id: "agt" },
+    { auth: { type: "api", key: "sk-test", metadata: { baseUrl: "http://127.0.0.1:18045" } } },
+    { foldEffortVariants: true, fetchImpl: async () => { throw new Error("ECONNREFUSED"); } },
+  );
+  assert.equal(fellBackFolded[Symbol.for("magpie.fellBack")], true);
+  assert.ok(fellBackFolded["gemini-4-neon"]);
+  assert.equal(fellBackFolded["gemini-4-neon-xhigh"], undefined);
+
+  // /v1beta/models fallback when /v1/models fails on a fresh baseUrl:
+  // test both default (coexist) and foldEffortVariants: true (synthesizes base from suffixed-only entry)
   clearModelCache();
-  const betaOnly = await reconcileModels(
+  const betaFetch = async (url) => {
+    if (url.endsWith("/v1/models")) return new Response("Not Found", { status: 404 });
+    return new Response(
+      JSON.stringify({
+        models: [
+          { name: "models/gemini-5-nova-xhigh", displayName: "Gemini 5 Nova (XHigh)", inputTokenLimit: 2000000, outputTokenLimit: 65536 },
+        ],
+      }),
+      { status: 200 },
+    );
+  };
+  const betaDefault = await reconcileModels(
     { id: "agt" },
     { auth: { type: "api", key: "sk-test", metadata: { baseUrl: "http://127.0.0.1:18046" } } },
-    {
-      fetchImpl: async (url) => {
-        if (url.endsWith("/v1/models")) return new Response("Not Found", { status: 404 });
-        return new Response(
-          JSON.stringify({
-            models: [
-              { name: "models/gemini-5-nova", displayName: "Gemini 5 Nova", inputTokenLimit: 2000000, outputTokenLimit: 65536 },
-              { name: "models/gemini-5-nova-xhigh", displayName: "Gemini 5 Nova (XHigh)", inputTokenLimit: 2000000, outputTokenLimit: 65536 },
-            ],
-          }),
-          { status: 200 },
-        );
-      },
-    },
+    { fetchImpl: betaFetch },
   );
-  assert.ok(betaOnly["gemini-5-nova"]);
-  assert.equal(betaOnly["gemini-5-nova"].limit.context, 2000000);
-  assert.deepEqual(Object.keys(betaOnly["gemini-5-nova"].variants), ["xhigh"]);
+  assert.equal(betaDefault["gemini-5-nova"], undefined);
+  assert.ok(betaDefault["gemini-5-nova-xhigh"]);
+  assert.equal(betaDefault["gemini-5-nova-xhigh"].name, "Gemini 5 Nova (XHigh)");
+  assert.equal(isXhighGeminiModel("http://127.0.0.1:18046", "gemini-5-nova"), true);
+
+  const betaFolded = await reconcileModels(
+    { id: "agt" },
+    { auth: { type: "api", key: "sk-test", metadata: { baseUrl: "http://127.0.0.1:18046" } } },
+    { foldEffortVariants: true, fetchImpl: betaFetch },
+  );
+  assert.ok(betaFolded["gemini-5-nova"]);
+  assert.equal(betaFolded["gemini-5-nova"].name, "Gemini 5 Nova");
+  assert.equal(betaFolded["gemini-5-nova"].limit.context, 2000000);
+  assert.deepEqual(Object.keys(betaFolded["gemini-5-nova"].variants), ["xhigh"]);
+  assert.equal(betaFolded["gemini-5-nova-xhigh"], undefined);
   assert.equal(isXhighGeminiModel("http://127.0.0.1:18046", "gemini-5-nova"), true);
 });
 
@@ -597,6 +645,26 @@ test("5. Dynamic xhigh detection (neon, hydrogen, tiered, synthetic gemini-5-nov
     body: JSON.stringify(basePayload),
   });
   assert.equal(captured[5].body.generationConfig.thinkingConfig.thinkingLevel, "high");
+
+  // suffixed model gemini-4-neon-xhigh passes through cleanly without effort rewrite
+  await mockFetch("http://127.0.0.1:18047/v1beta/models/gemini-4-neon-xhigh:generateContent", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(basePayload),
+  });
+  assert.equal(captured[6].url, "http://127.0.0.1:18047/v1beta/models/gemini-4-neon-xhigh:generateContent");
+  assert.equal(captured[6].body.generationConfig.thinkingConfig.thinkingLevel, "high");
+  assert.equal(captured[6].body.generationConfig.thinkingConfig.thinkingBudget, 8192);
+
+  // Even if X-Magpie-Effort: xhigh is attached to suffixed gemini-4-neon-xhigh, it does not rewrite
+  await mockFetch("http://127.0.0.1:18047/v1beta/models/gemini-4-neon-xhigh:generateContent", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Magpie-Effort": "xhigh" },
+    body: JSON.stringify(basePayload),
+  });
+  assert.equal(captured[7].body.generationConfig.thinkingConfig.thinkingLevel, "high");
+  assert.equal(captured[7].body.generationConfig.thinkingConfig.thinkingBudget, 8192);
+  assert.equal(captured[7].headers.has("x-magpie-effort"), false);
 });
 
 test("6. Dynamic quota pool discovery (including synthetic 4th pool) & reset_time model-to-pool matching", () => {
@@ -658,6 +726,48 @@ test("6. Dynamic quota pool discovery (including synthetic 4th pool) & reset_tim
   assert.ok(detail);
   assert.equal(detail.display, "Gemini 90%/50% · Claude 80%/60%  Argon 35%  Video Studio 75%");
   assert.ok(detail.display.split(" · ").length <= 2);
+
+  // Fallback to acc.quota.models without discoveredModels handles foldEffortVariants cleanly
+  const noDiscDefault = computeAgtUsage([acc], { showAccountDetails: false });
+  assert.ok(noDiscDefault.windows.find((w) => w.model === "gemini-4-neon"));
+  assert.ok(noDiscDefault.windows.find((w) => w.model === "gemini-4-neon-xhigh"));
+  const noDiscFolded = computeAgtUsage([acc], { showAccountDetails: false, foldEffortVariants: true });
+  assert.ok(noDiscFolded.windows.find((w) => w.model === "gemini-4-neon"));
+  assert.equal(noDiscFolded.windows.find((w) => w.model === "gemini-4-neon-xhigh"), undefined);
+
+  // When discoveredModels contains both base aliases and effort-suffixed models (default foldEffortVariants: false),
+  // BOTH keep their exact IDs in usage.windows and BOTH map to the right quota pool
+  const discoveredCoexist = {
+    "gemini-4-neon": { id: "gemini-4-neon", name: "Gemini 4 Neon", family: "Gemini" },
+    "gemini-4-neon-xhigh": { id: "gemini-4-neon-xhigh", name: "Gemini 4 Neon (XHigh)", family: "Gemini" },
+    "gemini-pro-orchestrator-g1-pro": { id: "gemini-pro-orchestrator-g1-pro", name: "Gemini Pro Orchestrator G1 Pro", family: "Gemini" },
+    "gemini-pro-orchestrator-g1-pro-high": { id: "gemini-pro-orchestrator-g1-pro-high", name: "Gemini Pro Orchestrator G1 Pro (High)", family: "Gemini" },
+    "veo-3": { id: "veo-3", name: "Veo 3", family: "Veo" },
+    "veo-3-high": { id: "veo-3-high", name: "Veo 3 (High)", family: "Veo" },
+  };
+  const coexistUsage = computeAgtUsage([acc], {
+    showAccountDetails: false,
+    discoveredModels: discoveredCoexist,
+  });
+  const neonBaseWin = coexistUsage.windows.find((w) => w.model === "gemini-4-neon");
+  const neonXhighWin = coexistUsage.windows.find((w) => w.model === "gemini-4-neon-xhigh");
+  const orchHighWin = coexistUsage.windows.find((w) => w.model === "gemini-pro-orchestrator-g1-pro-high");
+  const veoHighWin = coexistUsage.windows.find((w) => w.model === "veo-3-high");
+  assert.ok(neonBaseWin && neonBaseWin.pool === "Gemini" && neonBaseWin.used === 50);
+  assert.ok(neonXhighWin && neonXhighWin.pool === "Gemini" && neonXhighWin.used === 50);
+  assert.equal(neonXhighWin.name, "Gemini 4 Neon (XHigh)");
+  assert.ok(orchHighWin && orchHighWin.pool === "Gemini 4 Argon" && orchHighWin.used === 65);
+  assert.ok(veoHighWin && veoHighWin.pool === "Video Studio" && veoHighWin.used === 25);
+
+  // When foldEffortVariants: true, suffixed IDs are folded back to base IDs only
+  const foldedUsage = computeAgtUsage([acc], {
+    showAccountDetails: false,
+    foldEffortVariants: true,
+    discoveredModels: discoveredCoexist,
+  });
+  assert.ok(foldedUsage.windows.find((w) => w.model === "gemini-4-neon"));
+  assert.equal(foldedUsage.windows.find((w) => w.model === "gemini-4-neon-xhigh"), undefined);
+  assert.equal(foldedUsage.windows.find((w) => w.model === "veo-3-high"), undefined);
 });
 
 test("7. 429 / 503 error normalization injects exact model ID and preserves Retry-After", async () => {
@@ -708,6 +818,7 @@ test("8. Plugin metadata, official HTTPS icon, zero 'AGT' in user copy, 30s cool
   const pkg = JSON.parse(fs.readFileSync(path.join(PLUGIN_DIR, "package.json"), "utf8"));
   assert.equal(pkg.license, "MIT");
   assert.equal(pkg.magpie.icon, OFFICIAL_ICON_URL);
+  assert.equal(pkg.magpie.options.foldEffortVariants, false);
   assert.equal(pkg.magpie.options.refreshCooldownSec, 30);
   assert.equal(pkg.magpie.options.maxAccountDetails, 0);
   assert.equal(/\bAGT\b/.test(pkg.description), false);
@@ -727,7 +838,10 @@ test("8. Plugin metadata, official HTTPS icon, zero 'AGT' in user copy, 30s cool
   assert.equal(hooks.auth.provider, "agt");
   assert.equal(hooks.auth.single, true);
   assert.equal(hooks.auth.icon, OFFICIAL_ICON_URL);
-  assert.equal(hooks.auth.options.length, 3);
+  assert.equal(hooks.auth.options.length, 4);
+  const foldOpt = hooks.auth.options.find((o) => o.key === "fold_effort_variants");
+  assert.ok(foldOpt, "fold_effort_variants option must exist");
+  assert.equal(foldOpt.default, false);
   for (const opt of hooks.auth.options) {
     assert.equal(opt.placement, undefined, `option ${opt.key} must not set placement:"top"`);
     assert.equal(/\bAGT\b/.test(opt.label), false);
@@ -735,9 +849,38 @@ test("8. Plugin metadata, official HTTPS icon, zero 'AGT' in user copy, 30s cool
     assert.equal(/\bAGT\b/.test(opt.labels.zh), false);
     assert.equal(/\bAGT\b/.test(opt.descriptions.zh), false);
   }
+  const readme = fs.readFileSync(path.join(PLUGIN_DIR, "README.md"), "utf8");
+  assert.equal(/\bAGT\b/.test(readme), false);
   assert.equal(hooks.auth.methods[0].labels.zh, "Antigravity Tools 代理密钥");
   assert.ok(hooks.auth.methods[0].prompts[0].messages.zh.includes("http://127.0.0.1:8045"));
   assert.ok(hooks.auth.methods[0].prompts[1].messages.zh.includes("Antigravity Tools"));
+
+  // provider.models reads live fold_effort_variants option dynamically
+  clearModelCache();
+  let liveFold = false;
+  const liveHooks = await plugin.server({
+    magpie: {
+      options: () => ({ fold_effort_variants: liveFold }),
+    },
+  });
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    if (String(url).endsWith("/v1/models")) {
+      return new Response(JSON.stringify(makeSampleV1Payload()), { status: 200 });
+    }
+    return new Response("Not Found", { status: 404 });
+  };
+  try {
+    const authCtx = { auth: { type: "api", key: "sk-test", metadata: { baseUrl: "http://127.0.0.1:18049" } } };
+    const defaultList = await liveHooks.provider.models({ id: "agt" }, authCtx);
+    assert.ok(defaultList["gemini-4-neon"] && defaultList["gemini-4-neon-xhigh"]);
+    liveFold = true;
+    const foldedList = await liveHooks.provider.models({ id: "agt" }, authCtx);
+    assert.ok(foldedList["gemini-4-neon"]);
+    assert.equal(foldedList["gemini-4-neon-xhigh"], undefined);
+  } finally {
+    globalThis.fetch = origFetch;
+  }
 
   // config() creates clean shell without hardcoded models
   const cfg = { provider: {} };
