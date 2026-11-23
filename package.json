@@ -30,5 +30,17 @@
       "refreshCooldownSec": 30,
       "maxAccountDetails": 0
     }
+  },
+  "author": "ayatinene",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ayatinene/magpie-agt-plugin.git"
+  },
+  "homepage": "https://github.com/ayatinene/magpie-agt-plugin#readme",
+  "bugs": {
+    "url": "https://github.com/ayatinene/magpie-agt-plugin/issues"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.mjs"
   }
 }
